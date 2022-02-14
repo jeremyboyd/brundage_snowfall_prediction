@@ -1,0 +1,371 @@
+---
+title: "Snowbird precipitation models"
+author: "Jeremy Boyd"
+date: "2/9/2021"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+library(tidyverse)
+library(imputeTS)
+library(feather)
+source("get_station_data.R")
+source("get_buoy_data.R")
+source("prep_data_for_keras.R")
+source_python("fit_lstm.py")
+source_python("fit_cnn_lstm.py")
+
+```
+
+## Get Snowbird precipitation
+
+```{r get_precip}
+
+# Get Snowbird precipitation
+# NOTE: This function only takes a few seconds, so there's not much downside to
+# just running it over and over again--no need to revise to only add newest
+# data.
+sb_list <- get_station_data(station_id = "USS0011J42S",
+                            min_date = "1980-01-01")
+
+# View flags
+sb_list$flags
+
+# View data
+sb_list$data
+summary(sb_list$data)
+
+```
+
+## Get wave heights from buoy
+
+```{r get_wave_heights}
+
+# Read in saved data...
+wvht <- read_feather("wvht_buoy_51101.feather")
+
+# ... or pull freshest dataset from NDBC and save
+# wvht <- get_buoy_data(buoy_id = "51101")
+# write_feather(wvht, "wvht_buoy_51101.feather")
+
+# view
+wvht
+summary(wvht)
+
+```
+
+## Combine precipitation and wave height data
+
+```{r combine}
+
+# Combine into a single dataset
+df <- sb_list$data %>%
+    inner_join(wvht, by = "date")
+
+# View summary. Shows that after the join the variable with the most gaps is wvht at 14%!!
+summary(df)
+
+```
+
+# Impute missing values
+
+```{r impute}
+
+# There's almost no wvht data for 2008
+df %>%
+    mutate(year = year(date),
+           yday = yday(date)) %>%
+    ggplot(aes(x = yday, y = wvht)) +
+    geom_path() +
+    facet_wrap(~ year)
+
+# Drop everything prior to April 21, 2009, which avoids all early NAs
+df2 <- df %>% filter(date > "2009-04-20")
+
+# Only ts columns
+ts <- df2 %>% select(-matches("id|date|tobs"))
+ts_names <- names(ts)
+
+# Plot distribution of NAs in each series
+map(ts_names, function(name) {
+    df2 %>%
+        pull(name) %>%
+        ggplot_na_distribution(title = name)
+})
+
+# Do imputations
+ts_imp <- map_dfc(ts_names, function(name) {
+    
+    # Current ts with no imputation
+    no_imp <- df2 %>% pull(name)
+    
+    # Only do imputation if there's a missing value
+    if(sum(is.na(no_imp)) > 0) {
+        imp <- na_seadec(no_imp, find_frequency = TRUE)
+    } else { imp <- no_imp }
+
+    # Return this
+    tibble(imp)
+})
+names(ts_imp) <- ts_names
+
+# Check imputation quality. Not great, especially for temperature series. But
+# maybe better than nothing.
+map(ts_names, function(name) {
+    if(sum(is.na(ts %>% pull(name))) > 0) {
+        ggplot_na_imputations(ts %>% pull(name), ts_imp %>% pull(name), title = name)
+    }
+})
+
+# Add date
+ts_imp <- bind_cols(df2 %>% select(date), ts_imp)
+ts <- bind_cols(df2 %>% select(date), ts)
+
+```
+
+## Fit different datasets to single-layer LSTM
+
+- Powder buoy guy isn't really doing a prediction from 2 weeks out. See (see <https://www.skiutah.com/blog/authors/erika/the-man-behind-the-powder-buoy-and>). He's combining wave heights 2 weeks out with barometric pressure stuff a few days before.
+- To make what I'm doing a bit more like what he's doing, use an 18-day window prior to t to predict what happens at t. This allows me to detect wave stuff that's further in the past, and also use more recent meteorological measurements.
+- Read Chollet chapters on CNN...
+- Am I not getting good generalization because there are too many hidden units in LSTM layer?
+- Validation loss looks similar for different inputs...
+- Results are similar regardless of whether I convert to matrix in R (as.matrix, in the prep function), or in Python (to_numpy in fit function). But definitely different if I don't convert at all and input pandas dataframes. No errors get thrown, but results are quite different, which makes me think that keras really can't handle pandas input.
+- Fitting a model to the eight-predictor dataset for 300 epochs shows the classic overfitting pattern starting around 75 epochs: validation loss starts to go back up while training loss continues down.
+- Overfitting pattern starts ~ 75 epochs with learning rate of .001. Goes down to ~ 25 with a learning rate of .01. So we can train a model to overfit much faster with a larger learning rate.
+
+```{r model_different_datasets}
+
+# Set variables
+past <- 18
+future <- 1
+step <- 1L
+batch_size <- 256L
+epochs <- 600L
+patience <- epochs
+recurrent_dropout = .75
+other_dropout = .75
+
+# Learning rate. I get faster overgeneralization with .01 versus .001.
+learning_rate <- 0.004
+
+# Different sets of predictors to use in models
+pred_list <- list(c("yday"),
+                  c("prcp"),
+                  c("wvht"),
+                  c("prcp", "yday"),
+                  c("wvht", "prcp"),
+                  c(names(ts_imp)[-1], "yday"))
+
+# Loop over different sets of predictors
+results <- map(pred_list, function(preds) {
+    
+    # Prep datasets
+    prep_list <- prep_data_for_keras(data = ts_imp,
+                                     outcome = "prcp",
+                                     predictors <- preds,
+                                     split_fraction = .8,
+                                     past = past,
+                                     future = future)
+
+    # Fit CNN-LSTM model
+    fit_cnn_lstm(
+        data = prep_list,
+        step = step,
+        learning_rate = learning_rate,
+        batch_size = batch_size,
+        epochs = epochs,
+        patience = patience,
+        recurrent_dropout = recurrent_dropout,
+        other_dropout = other_dropout)
+})
+
+# Visualize losses for all models
+map(results, function(model) {
+    tibble(epoch = 1:length(model$loss),
+           train = model$loss,
+           val = model$val_loss) %>%
+    pivot_longer(cols = matches("train|val"),
+                 names_to = "type",
+                 values_to = "loss") %>%
+    ggplot(aes(x = epoch, y = loss, color = type)) +
+    geom_path() +
+    scale_x_continuous() +
+    scale_y_continuous(name = "loss (normalized MAE)") +
+    ggtitle(model$preds)
+})
+
+# Visualize actual versus predicted for all models
+rsq <- function(x, y) summary(lm(y ~ x))$r.squared
+map(results, function(model) {
+    
+    # Return to original scale
+    actual = model$actual_y * outcome_sd + outcome_mean
+    predicted = model$pred_y * outcome_sd + outcome_mean
+    
+    # Plot
+    tibble(actual = actual,
+           predicted = predicted) %>%
+    ggplot(aes(x = actual, y = predicted)) +
+        geom_point(alpha = .2, position = position_jitter()) +
+        geom_smooth(aes(x = actual, y = actual), method = "lm") +
+        scale_x_continuous(name = "Actual prcp (mm)") +
+        scale_y_continuous(name = "Predicted prcp (mm)") +
+        ggtitle(paste0(
+            model$preds, "\n",
+            "R-squared: ", round(rsq(actual, predicted),
+                                 digits = 2)))
+})
+
+# Looks like with these params I get a validation loss min ~ 200 epochs. Want to retrain to stop at 200, then do actual vs. predicted plot based on that.
+
+```
+
+## CNN-LSTM
+
+```{r cnn-lstm}
+
+# Set variables
+past <- 18
+future <- 1
+step <- 1L
+batch_size <- 256L
+epochs <- 50L
+patience <- epochs
+
+# Learning rate. I get faster overgeneralization with .01 versus .001.
+learning_rate <- 0.01
+
+# Different sets of predictors to use in models
+pred_list <- list(c("yday"),
+                  c("prcp"),
+                  c("wvht"),
+                  c("prcp", "yday"),
+                  c("wvht", "prcp"),
+                  c(names(ts_imp)[-1], "yday"))
+
+# Loop over different sets of predictors
+results <- map(pred_list, function(preds) {
+    
+    # Prep datasets
+    prep_list <- prep_data_for_keras(data = ts_imp,
+                                     outcome = "prcp",
+                                     predictors <- preds,
+                                     split_fraction = .8,
+                                     past = past,
+                                     future = future)
+
+    # Run model
+    fit_cnn_lstm(
+        data = prep_list,
+        step = step,
+        learning_rate = learning_rate,
+        batch_size = batch_size,
+        epochs = epochs,
+        patience = patience)
+})
+
+# Visualize losses for all models
+map(results, function(model) {
+    tibble(epoch = 1:length(model$loss),
+           train = model$loss,
+           val = model$val_loss) %>%
+    pivot_longer(cols = matches("train|val"),
+                 names_to = "type",
+                 values_to = "loss") %>%
+    ggplot(aes(x = epoch, y = loss, color = type)) +
+    geom_path() +
+    scale_x_continuous() +
+    scale_y_continuous(name = "loss (normalized MAE)") +
+    ggtitle(model$preds)
+})
+
+# Visualize actual versus predicted for all models
+rsq <- function(x, y) summary(lm(y ~ x))$r.squared
+map(results, function(model) {
+    tibble(actual = model$actual_y,
+           predicted = model$pred_y) %>%
+    ggplot(aes(x = actual, y = predicted)) +
+        geom_jitter(alpha = .2) +
+        geom_smooth(aes(x = actual, y = actual), method = "lm") +
+        ggtitle(paste0(
+            model$preds, "\n",
+            "R-squared: ", round(rsq(model$actual_y, model$pred_y),
+                                 digits = 2)))
+})
+
+```
+
+
+
+
+
+
+## Model 2 is same as 1, but trained 2 epochs
+
+```{python single_layer_LSTM_2, eval = FALSE}
+
+# Refit to 2 epochs
+history2 = model.fit(
+    dataset_train,
+    epochs = 2,
+    validation_data = dataset_val,
+    callbacks = [es_callback, modelckpt_callback],
+    verbose = 1,
+)
+
+# Store losses for use in R
+# Make history available to R by storing as separate lists
+train_loss2 = history2.history["loss"]
+val_loss2 = history2.history["val_loss"]
+
+# Make predictions for all validation samples
+len(x_val)
+len(y_val)
+
+# Pulls out a batch of inputs & targets
+for batch in dataset_val.take(1):
+    inputs_val, targets_val = batch
+    
+# Turn targets into a 1d array for easier reading into R
+targets_val = targets_val[:, 0].numpy()
+
+# Make predictions
+pred_val = model.predict(inputs_val)
+pred_val = pred_val[:, 0]
+
+```
+
+## Visualize validation actual versus predicted for model 2
+
+Shows that predictions aren't good given the current setup:
+- Consider 18 time steps in the past (~ 2.5 weeks)
+- Predict one day into the future
+- Single-layer LSTM
+- Wave height is the only predictor of precipitation
+
+
+
+```{r actual_predicted, eval = FALSE}
+
+act_pred <- tibble(actual = py$y_val[1:256, "0"],
+                   pred = py$pred_val)
+
+# Function to compute r-squared
+rsq <- function(x, y) summary(lm(y ~ x))$r.squared
+
+# Shows that we get actual precip values covering a pretty wide range, but the model only predicts values in a narrow window: from ~0 to 0.25.
+# Picture suggests that a good naive model might be to always predict 0 precipitation, since most days don't have any.
+# Better naive model would still be to predict the historical average for a month for any day in the month. Are we any better than that?
+act_pred %>%
+    ggplot(aes(x = actual, y = pred)) +
+    geom_point(alpha = .25) +
+    geom_line(aes(x = actual, y = actual, color = "red")) +
+    scale_x_continuous(name = "Actual precipitation (in)") +
+    scale_y_continuous(name = "Predicted precipitation (in)") +
+    ggtitle(paste("Model 2 r-squared = ",
+                  round(rsq(act_pred$actual, act_pred$pred), digits = 3)))
+
+```

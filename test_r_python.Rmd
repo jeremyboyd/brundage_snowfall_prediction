@@ -1,0 +1,455 @@
+---
+title: "Test R-Python Rmd"
+author: "Jeremy Boyd"
+date: "2/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+
+# Want this to read in data from the different sources. Maybe have functions to do this?
+# Clean up data, do padding if necessary
+# Port over to python to do modeling
+# Port results back to R for visualization
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{python single_layer_LSTM}
+
+# Resources
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+
+# Get data
+df = pd.read_csv("brundage_precip_51101_wvht.csv")
+
+# Make sure there are no missing values in data. This will screw up training.
+df.isnull().any()
+
+# Visualize time series
+titles = [
+    "Brundage precipitation (in)",
+    "Mean wave height at 51101 (m)",
+]
+feature_keys = [
+    "prcp",
+    "mean_wvht",
+]
+colors = [
+    "blue",
+    "orange",
+]
+
+date_time_key = "date"
+
+def show_raw_visualization(data):
+    time_data = data[date_time_key]
+    fig, axes = plt.subplots(
+        nrows=2, ncols=2,
+        figsize=(15, 20), dpi=80, facecolor="w", edgecolor="k"
+    )
+    for i in range(len(feature_keys)):
+        key = feature_keys[i]
+        c = colors[i % (len(colors))]
+        t_data = data[key]
+        t_data.index = time_data
+        t_data.head()
+        ax = t_data.plot(
+            ax=axes[i // 2, i % 2],
+            color=c,
+            title="{} - {}".format(titles[i], key),
+            rot=25,
+        )
+        ax.legend([titles[i]])
+    plt.tight_layout()
+show_raw_visualization(df)
+
+# Visualize correlations between time series
+def show_heatmap(data):
+    plt.matshow(data.corr())
+    plt.xticks(range(data.shape[1]), data.columns, fontsize=14, rotation=90)
+    plt.gca().xaxis.tick_bottom()
+    plt.yticks(range(data.shape[1]), data.columns, fontsize=14)
+
+    cb = plt.colorbar()
+    cb.ax.tick_params(labelsize=14)
+    plt.title("Feature Correlation Heatmap", fontsize=14)
+    plt.show()
+    
+# Drop date columnn in call to show_heatmap, otherwise it's considered data
+show_heatmap(df[["prcp", "mean_wvht"]])
+
+# Set up training & validation datasets
+split_fraction = 0.70   # 70% of rows for training
+step = 1                # No downsampling; walk through data one step at a time
+
+# df.shape[0] is number of rows; train_split is the number of rows being selected for training
+train_split = int(split_fraction * int(df.shape[0]))
+past = 14               # Train on 14 days of past data
+future = 7              # Predict value 7 days in future
+learning_rate = 0.001
+batch_size = 256
+epochs = 20
+
+# Function to normalize data
+def normalize(data, train_split):
+    data_mean = data[:train_split].mean(axis=0)
+    data_std = data[:train_split].std(axis=0)
+    return (data - data_mean) / data_std
+
+# Model features are based on feature_keys
+print(
+    "The selected parameters are:",
+    ", ".join([titles[i] for i in [0, 1]]),
+)
+selected_features = [feature_keys[i] for i in [0, 1]]
+features = df[selected_features]
+
+# Non-normalized version of validation data
+val_precip_orig = features.loc[train_split:]["prcp"]
+
+features.index = df[date_time_key]
+features.head()
+
+# Compute means & stds by hand
+means = features[:train_split].mean(axis = 0)
+stds = features[:train_split].std(axis = 0)
+
+# Mean & std for prcp
+mean_prcp = means[0]
+std_prcp = stds[0]
+
+# Apply normalization
+features = normalize(features.values, train_split)
+features = pd.DataFrame(features)
+features.head()
+
+# Training & validation sets
+train_data = features.loc[0 : train_split - 1]
+val_data = features.loc[train_split:]
+
+# Training inpu
+x_train = train_data[[i for i in range(train_data.shape[1])]].values
+
+# Training labels start from the 21st observation (14 past + 7 future)
+start = past + future
+end = start + train_split
+
+# The 0 index refers to the precipitation column--the outcome variable
+y_train = features.iloc[start:end][[0]]
+
+# Since step = 1 (no downsampling), the sequence length is the same as the number of past steps (= 14)
+sequence_length = int(past / step)
+
+# Create dataset of sliding windows over training data
+dataset_train = keras.preprocessing.timeseries_dataset_from_array(
+    x_train,
+    y_train,
+    sequence_length=sequence_length,
+    sampling_rate=step,
+    batch_size=batch_size,
+)
+
+# Define end of validation input, and start of validation labels
+x_end = len(val_data) - past - future
+label_start = train_split + past + future
+
+# Validation data
+x_val = val_data.iloc[:x_end][[i for i in range(val_data.shape[1])]].values
+y_val = features.iloc[label_start:][[0]]
+
+# Create dataset of sliding windows over validation data
+dataset_val = keras.preprocessing.timeseries_dataset_from_array(
+    x_val,
+    y_val,
+    sequence_length=sequence_length,
+    sampling_rate=step,
+    batch_size=batch_size,
+)
+
+# Taking batches of inputs & outputs from dataset_train?
+for batch in dataset_train.take(1):
+    inputs, targets = batch
+
+print("Input shape:", inputs.numpy().shape)
+print("Target shape:", targets.numpy().shape)
+
+# Define model
+inputs = keras.layers.Input(shape=(inputs.shape[1], inputs.shape[2]))
+lstm_out = keras.layers.LSTM(32)(inputs)
+outputs = keras.layers.Dense(1)(lstm_out)
+model = keras.Model(inputs=inputs, outputs=outputs)
+model.compile(optimizer=keras.optimizers.Adam(learning_rate=learning_rate), loss="mse")
+model.summary()
+
+# Train. Use ModelCheckpoint callback to save checkpoints, and EarlyStopping callback to interrupt training when validation loss is no longer improving.
+path_checkpoint = "model_checkpoint.h5"
+
+# If there's no improvement on val_loss for 5 epochs, stop training
+es_callback = keras.callbacks.EarlyStopping(monitor="val_loss", min_delta=0, patience=5)
+
+modelckpt_callback = keras.callbacks.ModelCheckpoint(
+    monitor="val_loss",
+    filepath=path_checkpoint,
+    verbose=1,
+    save_weights_only=True,
+    save_best_only=True,
+)
+
+# Fit model & record learning stats in history
+history = model.fit(
+    dataset_train,
+    epochs=epochs,
+    validation_data=dataset_val,
+    callbacks=[es_callback, 
+               modelckpt_callback],
+    verbose = 1,
+)
+
+# Val loss for R
+val_loss1 = min(history.history["val_loss"])
+
+# Visualize loss based on history
+def visualize_loss(history, title):
+    loss = history.history["loss"]
+    val_loss = history.history["val_loss"]
+    epochs = range(len(loss))
+    plt.figure()
+    plt.plot(epochs, loss, "b", label="Training loss")
+    plt.plot(epochs, val_loss, "r", label="Validation loss")
+    plt.title(title)
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.show()
+visualize_loss(history, "Training and Validation Loss")
+
+# Final loss value on training & evaluation sets. These are the same as the loss values for the final epoch in history
+model.evaluate(dataset_val)
+model.evaluate(dataset_train)
+
+# Initial fit shows lowest validation loss after 5 epochs, so retrain to 5
+history = model.fit(
+    dataset_train,
+    epochs = 5,
+    validation_data = dataset_val,
+    callbacks = [es_callback, modelckpt_callback],
+    verbose = 1,
+    )
+    
+# Make history available to R by storing as separate lists
+train_loss = history.history["loss"]
+val_loss = history.history["val_loss"]
+
+# Make predictions for all validation samples
+len(x_val)
+len(y_val)
+
+# Pulls out a batch of inputs & targets
+for batch in dataset_val.take(1):
+    inputs_val, targets_val = batch
+    
+# Turn targets into a 1d array for easier reading into R
+targets_val = targets_val[:, 0].numpy()
+
+# Make predictions
+pred_val = model.predict(inputs_val)
+pred_val = pred_val[:, 0]
+
+
+
+
+# Make predictions for five validation set samples
+def show_plot(plot_data, delta, title):
+    labels = ["History", "True Future", "Model Prediction"]
+    marker = [".-", "rx", "go"]
+    
+    # Generates a vector from -14 to -1
+    time_steps = list(range(-(plot_data[0].shape[0]), 0))
+    
+    # If delta is defined copy it to future
+    if delta:
+        future = delta
+    else:
+        future = 0
+
+    # Iterate over i & val in plot_data to build plot
+    plt.title(title)
+    for i, val in enumerate(plot_data):
+        if i:
+            plt.plot(future, plot_data[i], marker[i], markersize=10, label=labels[i])
+        else:
+            plt.plot(time_steps, plot_data[i].flatten(), marker[i], label=labels[i])
+    plt.legend()
+    plt.xlim([time_steps[0], (future + 5) * 2])
+    plt.xlabel("Day")
+    plt.ylabel("Precipitation (in)")
+    plt.show()
+    return
+
+# Take cout samples from dataset_val. Note: setting count to values greater than 4 doesn't return more than 4. On the other hand, seems like a single iteration of take() returns 150 samples, which are indexed from 0-149. Can I rewrite code to take advantage of that?
+for x, y in dataset_val.take(count = 4):
+    show_plot(
+        
+        # Plot data consist of an array representing precipitation values from time step -14 to -1; a single value representing the true precipitation at time step 7, and a prediction for precipitation at time step 7. Reverse centering & scaling on all plot data by multiplying by std and adding mean.
+        plot_data = [x[0][:, 0].numpy() * stds["prcp"] + means["prcp"],
+                     y[0].numpy() * stds["prcp"] + means["prcp"],
+                     model.predict(x)[0] * stds["prcp"] + means["prcp"]],
+        delta = 7,
+        title = "Single Step Prediction",
+    )
+
+```
+
+```{r training_history}
+
+# Plot training history by pulling in values from python
+library(tidyverse)
+losses <- tibble(epoch = 1:length(py$train_loss),
+                 train = py$train_loss,
+                 val = py$val_loss) %>%
+    pivot_longer(cols = matches("train|val"),
+                 names_to = "type",
+                 values_to = "loss")
+losses %>%
+    ggplot(aes(x = epoch, y = loss, color = type)) +
+    geom_path()
+
+```
+
+```{r actual_predicted}
+
+# Need to de-normalize to get to inches of precip
+act_pred <- tibble(actual = as.numeric(py$val_precip_orig)[1:256],
+                   pred = py$pred_val * py$std_prcp + py$mean_prcp)
+
+# Function to compute r-squared
+rsq <- function(x, y) summary(lm(y ~ x))$r.squared
+
+# Shows that we get actual precip values covering a pretty wide range, but the model only predicts values in a narrow window: from ~0 to 0.25.
+# Picture suggests that a good naive model might be to always predict 0 precipitation, since most days don't have any.
+# Better naive model would still be to predict the historical average for a month for any day in the month. Are we any better than that?
+act_pred %>%
+    ggplot(aes(x = actual, y = pred)) +
+    geom_point(alpha = .25) +
+    geom_line(aes(x = actual, y = actual, color = "red")) +
+    scale_x_continuous(name = "Actual precipitation (in)") +
+    scale_y_continuous(name = "Predicted precipitation (in)",
+                       limits = c(-.01, .3)) +
+    ggtitle(paste("LSTM r-squared = ",
+                  round(rsq(act_pred$actual, act_pred$pred), digits = 3)))
+
+
+```
+
+```{r naive_model}
+
+library(lubridate)
+
+# Naive model where daily precipitation predictions are the historical mean for the month
+d <- read_csv("brundage_precip_51101_wvht.csv")
+
+# Month means
+month_means <- d %>%
+    mutate(month = month(date)) %>%
+    group_by(month) %>%
+    summarize(n_days = sum(!is.na(prcp)),
+              mean_prcp = mean(prcp, is.na = FALSE), .groups = "drop")
+
+# Add precip predictions of a naive model to each date
+d2 <- d %>%
+    mutate(month = month(date)) %>%
+    left_join(month_means %>%
+                  select(month, prcp_naive = mean_prcp),
+              by = "month")
+
+# Plot actual vs. predicted. This model is okay for very low precipitation values, but sucks for anything above ~ 0.5 because it never predicts higher values.
+d2 %>%
+    ggplot(aes(x = prcp, y = prcp_naive)) +
+    geom_point(alpha = .15) +
+    geom_line(aes(x = prcp, y = prcp, color = "red")) +
+    scale_x_continuous(name = "Actual precipitation (in)") +
+    scale_y_continuous(name = "Predicted precipitation (in)") +
+    ggtitle(paste("Naive month r-squared = ",
+                  round(rsq(d2$prcp, d2$prcp_naive), digits = 3)))
+
+```
+```{python two_layer_LSTM}
+
+# Define 2-layer LSTM
+inputs = keras.layers.Input(shape = (inputs.shape[1], inputs.shape[2]))
+lstm_out1 = keras.layers.LSTM(32, return_sequences = True)(inputs)
+lstm_out2 = keras.layers.LSTM(32)(lstm_out1)
+outputs = keras.layers.Dense(1)(lstm_out2)
+model = keras.Model(inputs = inputs, outputs = outputs)
+model.compile(optimizer = keras.optimizers.Adam(learning_rate = learning_rate), loss="mse")
+model.summary()
+
+# Train. Use ModelCheckpoint callback to save checkpoints, and EarlyStopping callback to interrupt training when validation loss is no longer improving.
+path_checkpoint = "model_checkpoint.h5"
+
+# If there's no improvement on val_loss for 5 epochs, stop training
+es_callback = keras.callbacks.EarlyStopping(monitor="val_loss", min_delta = 0, patience = 5)
+
+modelckpt_callback = keras.callbacks.ModelCheckpoint(
+    monitor="val_loss",
+    filepath = path_checkpoint,
+    verbose = 1,
+    save_weights_only = True,
+    save_best_only = True,
+)
+
+# Fit model & record learning stats in history
+history = model.fit(
+    dataset_train,
+    epochs = epochs,
+    validation_data = dataset_val,
+    callbacks = [es_callback,  modelckpt_callback],
+)
+
+# Save min val loss for R
+val_loss2 = min(history.history["val_loss"])
+
+```
+
+
+# The one and two-layer LSTMs have nearly identical validation losses
+
+```{r val_loss2}
+
+tibble(one_layer_lstm = py$val_loss1,
+       two_layer_lstm = py$val_loss2) %>%
+    pivot_longer(cols = everything(), names_to = "model",
+                 values_to = "val_loss") %>%
+    ggplot(aes(x = model, y = val_loss)) +
+    geom_point(color = "dodgerblue", alpha = .3, size = 4)
+
+```
+
+# Stuff to do
+
+- Add convolutions
+- Can any of this predict wasatch storm?

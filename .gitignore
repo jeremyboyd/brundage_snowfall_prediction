@@ -1,0 +1,16 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+*.png
+Snowbird_precipitation_models_files
+*.gif
+*.csv
+*.csv
+*.zip
+*.h5
+*.RData
+renv
+*.feather
+MNIST_classifier.Rmd
